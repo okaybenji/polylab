@@ -3,6 +3,16 @@ const nodes = {}; // {id: node}
 const controllers = []; // Used to ensure MIDI messages get passed along to each controller.
 
 // TODO: Each time outs are updated, loop through each and connect them to their outs.
+const reconnectNodes = () => {
+  Object.values(nodes).forEach((node) => {
+    if (node.disconnect) {
+      node.disconnect();
+    }
+    if (node.connect) {
+      node.outs.forEach(o => node.connect(nodes[o] && nodes[o].connect ? nodes[o] : audioCtx.destination));
+    }
+  });
+};
 
 const Polylab = (audioCtx) => {
   navigator.requestMIDIAccess()
@@ -23,14 +33,28 @@ const Polylab = (audioCtx) => {
   // Creates a node utilizing an existing method in the AudioContext API.
   const createNode = (method) => {
     const node = audioCtx[method]();
-    node.id = id++; // TODO: Consider removing this prop.
     node.outs = []; // Array of IDs of destination nodes for this node. (Eventually should be object w/ ID and prop.)
-    nodes[node.id] = node;
+    nodes[id++] = node;
     return node;
   };
 
+  // Get the current time, and cancel scheduled values.
+  const getNow = () => {
+    var now = audioCtx.currentTime;
+    synth.amp.gain.cancelScheduledValues(now);
+    synth.amp.gain.setValueAtTime(synth.amp.gain.value, now);
+    return now;
+  }
+
   return {
-    amp: () => createNode('createGain'),
+    amp({gain = 0.9} = {}) {
+      const amp = createNode('createGain');
+      amp.max = gain;
+      amp.gain.setValueAtTime(gain, audioCtx.currentTime);
+
+      return amp;
+    },
+    cut: ({freq = 7500} = {}) => ({id: id++, max: freq}),
     filter: () => createNode('createBiquadFilter'),
     pan: () => createNode('createPanner'),
     osc() {
@@ -39,9 +63,33 @@ const Polylab = (audioCtx) => {
       return osc;
     },
     // AD & R in seconds; S out of 1.
-    env({attack = 0.1, decay = 0.0, sustain = 1.0, release = 0.0}) {
+    env({attack = 0.2, decay = 0.2, sustain = 0.4, release = 0.2} = {}) {
       const _id = id++;
-      const env = {id: _id, attack, decay, sustain, release};
+      const outs = [];
+      const prop = 'gain'; // For now, controlling just gain of amps.
+
+      const triggerAttack = () => {
+        const dests = outs.map(id => nodes[id]);
+        dests.forEach((dest) => {
+          dest[prop].cancelScheduledValues(audioCtx.currentTime);
+          dest[prop].setValueAtTime(dest[prop].value, audioCtx.currentTime);
+          dest[prop].linearRampToValueAtTime(dest.max, audioCtx.currentTime + parseFloat(attack));
+          // TODO: Can I delay this until above ramp completes?
+          // (Need to do this in submono as well)
+          dest[prop].linearRampToValueAtTime(sustain * dest.max, audioCtx.currentTime + attack + decay);
+        });
+      };
+
+      const triggerRelease = () => {
+        const dests = outs.map(id => nodes[id]);
+        dests.forEach((dest) => {
+          dest[prop].cancelScheduledValues(audioCtx.currentTime);
+          dest[prop].setValueAtTime(dest[prop].value, audioCtx.currentTime);
+          dest[prop].linearRampToValueAtTime(0, audioCtx.currentTime + parseFloat(release));
+        });
+      };
+
+      const env = {id: _id, attack, decay, sustain, release, triggerAttack, triggerRelease, outs};
       nodes[_id] = env;
       return env;
     },
@@ -52,14 +100,14 @@ const Polylab = (audioCtx) => {
 
       const handleMsg = (msg) => {
         const dests = outs.map(id => nodes[id]);
-        console.log('dests:', dests);
-        const [cmd] = msg.data;
+        const [cmd, , val] = msg.data;
         const round = val => val.toFixed(2);
         const frequency = note => Math.pow(2, (note - 69) / 12) * 440;
         const normalize = val => val / 127;
         // Command range represents 16 channels
         const command =
           cmd >= 128 && cmd < 144 ? 'off'
+          : cmd >= 144 && cmd < 160 && val === 0 ? 'off'
           : cmd >= 144 && cmd < 160 ? 'on'
           : cmd >= 224 && cmd < 240 ? 'pitch'
           : cmd >= 176 && cmd < 192 ? 'ctrl'
@@ -68,12 +116,16 @@ const Polylab = (audioCtx) => {
         const exec = {
           off() {
             const [, note, velocity] = msg.data;
-            // TODO...
+            dests.forEach(d => d.triggerRelease && d.triggerRelease());
             console.log(`${command} ${note}`);
           },
           on() {
             const [, note, velocity] = msg.data;
-            dests.forEach(d => d[prop].setValueAtTime(frequency(note), audioCtx.currentTime));
+            dests.forEach(d => {
+              d[prop] ? d[prop].setValueAtTime(frequency(note), audioCtx.currentTime)
+              : d.triggerAttack ? d.triggerAttack()
+              : null;
+            });
             // TODO: Handle velocity
             console.log(`${command} ${note} ${round(normalize(velocity) * 100)}%`);
           },
